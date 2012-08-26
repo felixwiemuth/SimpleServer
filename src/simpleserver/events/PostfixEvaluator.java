@@ -22,8 +22,11 @@ package simpleserver.events;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 
 import simpleserver.Player;
+import simpleserver.config.GiveAliasList.Item;
+import simpleserver.config.xml.Area;
 
 @SuppressWarnings("unused")
 public class PostfixEvaluator {
@@ -52,7 +55,6 @@ public class PostfixEvaluator {
     ops.put("*", "mul");
     ops.put("/", "div");
     ops.put("%", "mod");
-    ops.put("rand", "rand");
 
     ops.put("gt", "gt");
     ops.put("lt", "lt");
@@ -65,14 +67,21 @@ public class PostfixEvaluator {
 
     ops.put("int", "str2num");
     ops.put("bool", "str2bool");
+    ops.put("rand", "rand");
+    ops.put("currtime", "currtime");
     ops.put("totime", "int2timestr");
     ops.put("evalvar", "evalvar");
+    ops.put("getitemalias", "id2alias");
+    ops.put("getitemid", "alias2id");
 
     ops.put("dup", "dup");
     ops.put("drop", "drop");
     ops.put("flip", "flip");
 
     ops.put("getgroup", "getgroup");
+    ops.put("getplayers", "getplayers");
+    ops.put("isinarea", "isinarea");
+    ops.put("getcoord", "getcoord");
 
     /* array ops */
 
@@ -85,9 +94,11 @@ public class PostfixEvaluator {
     ops.put("Aremove", "arrayremove");
     ops.put("Asize", "arraysize");
     ops.put("Aisempty", "arrayisempty");
+    ops.put("Acontains", "arraycontains");
     ops.put("Aget", "arrayget");
     ops.put("Agetlast", "arraygetlast");
     ops.put("Ajoin", "arrayjoin");
+    ops.put("Aexplode", "arrayexplode");
 
     /* hash ops */
     ops.put("Hnew", "hashnew");
@@ -139,7 +150,7 @@ public class PostfixEvaluator {
   }
 
   private void push(String val) {
-    expstack.add(0, val);
+    expstack.add(0, String.valueOf(val));
   }
 
   private void push(long val) {
@@ -166,6 +177,12 @@ public class PostfixEvaluator {
     try {
       while (tokens.size() > 0) {
         String elem = tokens.remove(0);
+        if (elem.charAt(0) == RunningEvent.REFERENCEOP) { // escape->as string
+          elem = elem.substring(1);
+          push(elem);
+          continue;
+        }
+
         if (ops.containsKey(elem)) { // look through methods
           this.getClass().getDeclaredMethod(ops.get(elem), new Class[] {}).invoke(this);
         } else { // no method in hash -> regular value
@@ -273,7 +290,9 @@ public class PostfixEvaluator {
     val = val.substring(1, val.length() - 1);
     for (String s : val.split("(?<!\\\\),")) {
       s = unescape(s, ",");
-      arr.add(s);
+      if (!s.equals("")) {
+        arr.add(s);
+      }
     }
 
     return arr;
@@ -300,6 +319,7 @@ public class PostfixEvaluator {
     if (val.size() > 0) {
       for (String key : val.keySet()) {
         String t = val.get(key);
+        key = escape(key, ",:");
         t = escape(t, ",:");
         s += key + ":" + t + ",";
       }
@@ -323,7 +343,7 @@ public class PostfixEvaluator {
       if (toks.length != 2) {
         return new HashMap<String, String>();
       }
-      ret.put(toks[0], unescape(toks[1], ",:"));
+      ret.put(unescape(toks[0], ",:"), unescape(toks[1], ",:"));
     }
 
     return ret;
@@ -457,6 +477,10 @@ public class PostfixEvaluator {
     push(popBool());
   }
 
+  private void currtime() {
+    push(String.valueOf(System.currentTimeMillis()));
+  }
+
   private void int2timestr() {
     push(fmtTime(popNum()));
   }
@@ -468,6 +492,32 @@ public class PostfixEvaluator {
       push(v);
     } else {
       e.notifyError("Warning: Invalid variable: " + s + "! Returning null");
+      push("null");
+    }
+  }
+
+  private void id2alias() {
+    String[] id = pop().split(":");
+    String alias = "null";
+    if (id.length == 1) {
+      alias = e.server.giveAliasList.getAlias(Integer.valueOf(id[0]), 0);
+    }
+    else {
+      alias = e.server.giveAliasList.getAlias(Integer.valueOf(id[0]), Integer.valueOf(id[1]));
+    }
+    push(alias);
+  }
+
+  private void alias2id() {
+    String alias = pop();
+    Item i = e.server.giveAliasList.getItemId(alias);
+    if (i != null) {
+      String id = String.valueOf(i.id);
+      if (i.damage != 0) {
+        id += ":" + String.valueOf(i.damage);
+      }
+      push(id);
+    } else {
       push("null");
     }
   }
@@ -497,11 +547,54 @@ public class PostfixEvaluator {
     String s = pop();
     Player tmp = e.server.findPlayer(s);
     if (tmp == null) {
-      e.notifyError("Player not found! Returning group -1");
+      e.notifyError("getgroup: Player not found! Returning group -1");
       push(-1);
     } else {
       push(tmp.getGroupId());
     }
+  }
+
+  private void getplayers() {
+    ArrayList<String> players = new ArrayList<String>();
+    for (Player p : e.server.playerList.getArray()) {
+      players.add(p.getName());
+    }
+    push(players);
+
+  }
+
+  private void isinarea() {
+    String area = pop();
+    String player = pop();
+    Player p = e.server.findPlayer(player);
+    if (p == null) {
+      e.notifyError("isarea: Player not found!");
+      push(false);
+    }
+    HashSet<Area> areas = new HashSet<Area>(e.server.config.dimensions.areas(p.position()));
+    for (Area a : areas) {
+      if (a.name.equals(area)) {
+        push(true);
+        return;
+      }
+    }
+    push(false);
+    return;
+  }
+
+  private void getcoord() {
+    String player = pop();
+    Player p = e.server.findPlayer(player);
+    if (p == null) {
+      e.notifyError("isarea: Player not found!");
+      push(false);
+    }
+
+    ArrayList<String> c = new ArrayList<String>();
+    c.add(String.valueOf(p.position().x()));
+    c.add(String.valueOf(p.position().y()));
+    c.add(String.valueOf(p.position().z()));
+    push(c);
   }
 
   /* array ops */
@@ -575,6 +668,12 @@ public class PostfixEvaluator {
     }
   }
 
+  private void arraycontains() {
+    String val = pop();
+    ArrayList<String> arr = popArray();
+    push(arr.contains(val));
+  }
+
   private void arraygetlast() {
     ArrayList<String> arr = popArray();
 
@@ -608,6 +707,17 @@ public class PostfixEvaluator {
       }
     }
     push(s);
+  }
+
+  private void arrayexplode() {
+    ArrayList<String> arr = popArray();
+    if (arr.size() > 0) {
+      for (String e : arr) {
+        push(e);
+      }
+    } else {
+      push("null");
+    }
   }
 
   /* hash ops */
@@ -656,7 +766,7 @@ public class PostfixEvaluator {
       if (val == null) {
         val = "null";
       }
-      push(unescape(val, ",:"));
+      push(val);
     } else {
       e.notifyError("Invalid hash key!");
       push("null");

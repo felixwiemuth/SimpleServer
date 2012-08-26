@@ -56,7 +56,6 @@
 <!ATTLIST command
   name CDATA #REQUIRED
   allow CDATA #IMPLIED
-  forward NMTOKEN #IMPLIED
   hidden NMTOKEN #IMPLIED
   rename CDATA #IMPLIED
   forward NMTOKEN #IMPLIED
@@ -72,7 +71,7 @@
   interval CDATA #IMPLIED
   allow CDATA #IMPLIED
   disabled CDATA #IMPLIED
-  isbutton CDATA #IMPLIED
+  type CDATA #IMPLIED
   value CDATA #IMPLIED
 >
 <!ATTLIST argument
@@ -102,8 +101,7 @@
   end CDATA #REQUIRED
   owner NMTOKEN #IMPLIED
   priority NMTOKEN #IMPLIED
-  onenter CDATA #IMPLIED
-  onleave CDATA #IMPLIED
+  event CDATA #IMPLIED
 >
 <!ATTLIST permission
   allow CDATA #REQUIRED

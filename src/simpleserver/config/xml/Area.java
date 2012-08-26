@@ -37,8 +37,7 @@ public class Area extends PermissionContainer implements Comparable<Area> {
   int level;
   Area parent;
 
-  public String onenter;
-  public String onleave;
+  public String event;
 
   private static final String NAME = "name";
   private static final String START = "start";
@@ -46,8 +45,7 @@ public class Area extends PermissionContainer implements Comparable<Area> {
   private static final String OWNER = "owner";
   private static final String PRIORITY = "priority";
 
-  private static final String ONENTER = "onenter";
-  private static final String ONLEAVE = "onleave";
+  private static final String EVENT = "event";
 
   Area() {
     super("area");
@@ -88,15 +86,13 @@ public class Area extends PermissionContainer implements Comparable<Area> {
     } else if (name.equals(START)) {
       start = getCoord(value, 0);
     } else if (name.equals(END)) {
-      end = getCoord(value, 127);
+      end = getCoord(value, 255);
     } else if (name.equals(OWNER)) {
       owner = value;
     } else if (name.equals(PRIORITY)) {
       priority = getInt(value);
-    } else if (name.equals(ONENTER)) {
-      onenter = value;
-    } else if (name.equals(ONLEAVE)) {
-      onleave = value;
+    } else if (name.equals(EVENT)) {
+      event = value;
     }
   }
 
@@ -115,11 +111,8 @@ public class Area extends PermissionContainer implements Comparable<Area> {
       attributes.addAttribute(OWNER, owner);
     }
 
-    if (onenter != null) {
-      attributes.addAttribute(ONENTER, onenter);
-    }
-    if (onleave != null) {
-      attributes.addAttribute(ONLEAVE, onleave);
+    if (event != null) {
+      attributes.addAttribute(EVENT, event);
     }
   }
 
@@ -155,6 +148,6 @@ public class Area extends PermissionContainer implements Comparable<Area> {
       z = getInt(parts[2]);
     }
 
-    return new Coordinate(x, (byte) y, z);
+    return new Coordinate(x, y, z);
   }
 }

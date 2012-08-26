@@ -23,8 +23,10 @@ package simpleserver;
 import static simpleserver.lang.Translations.t;
 
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.net.InetAddress;
 import java.net.Socket;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -53,6 +55,9 @@ import simpleserver.config.xml.Permission;
 import simpleserver.message.AbstractChat;
 import simpleserver.message.Chat;
 import simpleserver.message.GlobalChat;
+import simpleserver.stream.Encryption;
+import simpleserver.stream.Encryption.ClientEncryption;
+import simpleserver.stream.Encryption.ServerEncryption;
 import simpleserver.stream.StreamTunnel;
 
 public class Player {
@@ -64,6 +69,9 @@ public class Player {
   private StreamTunnel serverToClient;
   private StreamTunnel clientToServer;
   private Watchdog watchdog;
+
+  public ServerEncryption serverEncryption = new Encryption.ServerEncryption();
+  public ClientEncryption clientEncryption = new Encryption.ClientEncryption();
 
   private String name = null;
   private String renameName = null;
@@ -239,6 +247,10 @@ public class Player {
       connectionHash = server.nextHash();
     }
     return connectionHash;
+  }
+
+  public String getLoginHash() throws NoSuchAlgorithmException, UnsupportedEncodingException {
+    return clientEncryption.getLoginHash(getConnectionHash());
   }
 
   public double distanceTo(Player player) {
@@ -523,23 +535,7 @@ public class Player {
     CommandConfig config = server.config.commands.getTopConfig(commandName);
     String originalName = config == null ? commandName : config.originalName;
 
-    PlayerCommand command;
-    if (config == null) {
-      command = server.getCommandParser().getPlayerCommand(commandName);
-      if (command != null && !command.hidden()) {
-        command = null;
-      }
-    } else {
-      command = server.getCommandParser().getPlayerCommand(originalName);
-    }
-
-    if (command == null) {
-      if (groupObject.forwardUnknownCommands || config != null) {
-        command = new ExternalCommand(commandName);
-      } else {
-        command = server.getCommandParser().getPlayerCommand((String) null);
-      }
-    }
+    PlayerCommand command = server.resolvePlayerCommand(originalName, groupObject);
 
     if (config != null && !overridePermissions) {
       Permission permission = server.config.getCommandPermission(config.name, args, position.coordinate());
@@ -553,11 +549,11 @@ public class Player {
       if (server.options.getBoolean("enableEvents") && config.event != null) {
         Event e = server.eventhost.findEvent(config.event);
         if (e != null) {
-          ArrayList<String> stack = null;
+          ArrayList<String> arguments = new ArrayList<String>();
           if (!args.equals("")) {
-            stack = new ArrayList<String>(java.util.Arrays.asList(args.split("\\s+")));
+            arguments = new ArrayList<String>(java.util.Arrays.asList(args.split("\\s+")));
           }
-          server.eventhost.execute(e, this, true, stack);
+          server.eventhost.execute(e, this, true, arguments);
         } else {
           System.out.println("Error in player command " + originalName + ": Event " + config.event + " not found!");
         }
@@ -571,7 +567,13 @@ public class Player {
     }
 
     if (command instanceof ExternalCommand) {
-      return "/" + originalName + " " + args;
+      // commands with bound events have to be forwarded explicitly
+      // (to prevent unknown command error by server)
+      if (config.event != null && config.forwarding == Forwarding.NONE) {
+        return null;
+      } else {
+        return "/" + originalName + " " + args;
+      }
     } else if ((config != null && config.forwarding != Forwarding.NONE) || server.config.properties.getBoolean("forwardAllCommands")) {
       return message;
     } else {
@@ -890,30 +892,32 @@ public class Player {
     oldAreas.removeAll(areas); // -> now contains only areas not present anymore
 
     for (Area a : areasCopy) { // run area onenter events
-      if (a.onenter == null) {
+      if (a.event == null) {
         continue;
       }
-      Event e = server.eventhost.findEvent(a.onenter);
+      Event e = server.eventhost.findEvent(a.event);
       if (e != null) {
-        ArrayList<String> stack = new ArrayList<String>();
-        stack.add(a.name);
-        server.eventhost.execute(e, this, true, stack);
+        ArrayList<String> args = new ArrayList<String>();
+        args.add("enter");
+        args.add(a.name);
+        server.eventhost.execute(e, this, true, args);
       } else {
-        System.out.println("Error in area " + a.name + "/onenter: Event " + a.onenter + " not found!");
+        System.out.println("Error in area " + a.name + "/event: Event " + a.event + " not found!");
       }
     }
 
     for (Area a : oldAreas) { // run area onleave events
-      if (a.onleave == null) {
+      if (a.event == null) {
         continue;
       }
-      Event e = server.eventhost.findEvent(a.onleave);
+      Event e = server.eventhost.findEvent(a.event);
       if (e != null) {
-        ArrayList<String> stack = new ArrayList<String>();
-        stack.add(a.name);
-        server.eventhost.execute(e, this, true, stack);
+        ArrayList<String> args = new ArrayList<String>();
+        args.add("leave");
+        args.add(a.name);
+        server.eventhost.execute(e, this, true, args);
       } else {
-        System.out.println("Error in area " + a.name + "/onleave: Event " + a.onleave + " not found!");
+        System.out.println("Error in area " + a.name + "/event: Event " + a.event + " not found!");
       }
     }
 
@@ -931,7 +935,7 @@ public class Player {
     Iterator<Event> it = server.eventhost.events.keySet().iterator();
     while (it.hasNext()) {
       Event ev = it.next();
-      if (ev.isbutton || ev.coordinate == null) {
+      if (!ev.type.equals("plate") || ev.coordinate == null) {
         continue;
       }
       if (position.coordinate().equals(ev.coordinate)) { // matching -> execute
@@ -950,7 +954,7 @@ public class Player {
     Iterator<Event> it = server.eventhost.events.keySet().iterator();
     while (it.hasNext()) {
       Event ev = it.next();
-      if (!ev.isbutton || ev.coordinate == null) {
+      if (!ev.type.equals("button") || ev.coordinate == null) {
         continue;
       }
       if ((new Coordinate(c.x(), c.y(), c.z(), position.dimension())).equals(ev.coordinate)) { // matching

@@ -20,15 +20,20 @@
  */
 package simpleserver.events;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 
 import simpleserver.Coordinate;
 import simpleserver.Player;
 import simpleserver.Server;
-import simpleserver.command.CommandFeedback;
-import simpleserver.command.InvalidCommand;
+import simpleserver.bot.BotController.ConnectException;
+import simpleserver.bot.NpcBot;
+import simpleserver.command.ExternalCommand;
+import simpleserver.command.PlayerCommand;
 import simpleserver.command.ServerCommand;
+import simpleserver.config.xml.CommandConfig;
+import simpleserver.config.xml.CommandConfig.Forwarding;
 import simpleserver.config.xml.Event;
 
 class RunningEvent extends Thread implements Runnable {
@@ -45,11 +50,12 @@ class RunningEvent extends Thread implements Runnable {
   // (default -> triggering player)
   private String threadname = null; // null = just subroutine
 
-  private static final int MAXDEPTH = 5;
-  private static final char LOCALSCOPE = '#';
-  private static final char PLAYERSCOPE = '@';
-  private static final char GLOBALSCOPE = '$';
-  private static final char REFERENCEOP = '\'';
+  protected static final int MAXDEPTH = 5;
+
+  protected static final char LOCALSCOPE = '#';
+  protected static final char PLAYERSCOPE = '@';
+  protected static final char GLOBALSCOPE = '$';
+  protected static final char REFERENCEOP = '\'';
 
   private HashMap<String, String> vars; // local vars
   private ArrayList<String> threadstack; // thread-shared data stack
@@ -124,12 +130,12 @@ class RunningEvent extends Thread implements Runnable {
       // run action
       String cmd = tokens.remove(0);
       if (cmd.equals("return")) {
+        cmdreturn(tokens);
         return;
       } else if (cmd.equals("rem") || cmd.equals("endif")) {
         currline++;
         continue;
-      }
-      else if (cmd.equals("print") && tokens.size() > 0) {
+      } else if (cmd.equals("print") && tokens.size() > 0) {
         System.out.println("L" + String.valueOf(currline) + "@" + event.name + " msg: " + tokens.get(0));
       } else if (cmd.equals("sleep") && tokens.size() > 0) {
         try {
@@ -139,14 +145,20 @@ class RunningEvent extends Thread implements Runnable {
             break;
           }
         }
-      } else if (cmd.equals("say")) {
-        say(tokens);
-      } else if (cmd.equals("broadcast") && tokens.size() > 0) {
-        server.runCommand("say", tokens.get(0));
-      } else if (cmd.equals("give")) {
-        give(tokens);
       } else if (cmd.equals("teleport")) {
         teleport(tokens);
+      } else if (cmd.equals("npc")) {
+        npcSpawn(tokens);
+      } else if (cmd.equals("npckill")) {
+        npcKill(tokens);
+      } else if (cmd.equals("say")) {
+        say(tokens);
+      } else if (cmd.equals("broadcast")) {
+        broadcast(tokens);
+      } else if (cmd.equals("execsvrcmd")) {
+        execsvrcmd(tokens);
+      } else if (cmd.equals("execcmd")) {
+        execcmd(tokens);
       } else if (cmd.equals("set")) {
         set(tokens);
       } else if (cmd.equals("inc")) {
@@ -155,10 +167,6 @@ class RunningEvent extends Thread implements Runnable {
         decrement(tokens);
       } else if (cmd.equals("push")) {
         push(tokens);
-      } else if (cmd.equals("run")) {
-        cmdrun(tokens, false);
-      } else if (cmd.equals("launch")) {
-        cmdrun(tokens, true);
       } else if (cmd.equals("if")) {
         condition(tokens, actions);
       } else if (cmd.equals("else")) {
@@ -169,16 +177,19 @@ class RunningEvent extends Thread implements Runnable {
         breakloop(tokens, actions);
       } else if (cmd.equals("endwhile") || cmd.equals("continue")) {
         currline = whilestack.remove(0);
-      } else if (cmd.equals("execsvrcmd")) {
-        execsvrcmd(tokens);
-      } else if (cmd.equals("execcmd")) {
-        execcmd(tokens);
+      } else if (cmd.equals("run")) {
+        cmdrun(tokens, false);
+      } else if (cmd.equals("launch")) {
+        cmdrun(tokens, true);
       } else {
         notifyError("Command not found!");
       }
 
       currline++;
     }
+
+    // implicit return value -> empty array
+    threadstack.add(0, PostfixEvaluator.fromArray(new ArrayList<String>()));
 
     // finished -> remove itself from the running thread list
     if (threadname != null) {
@@ -240,8 +251,13 @@ class RunningEvent extends Thread implements Runnable {
       return "";
     }
 
-    if (varname.charAt(0) == REFERENCEOP) {
-      return varname.substring(1);
+    if (varname.charAt(0) == REFERENCEOP) { // escape variable
+      char c = varname.charAt(1);
+      if (c == LOCALSCOPE || c == PLAYERSCOPE || c == GLOBALSCOPE) {
+        return varname.substring(1);
+      } else {
+        return null; // not a variable
+      }
     } else if (varname.charAt(0) == LOCALSCOPE) { // local var
       String loc = varname.substring(1);
       // check special vars
@@ -252,11 +268,9 @@ class RunningEvent extends Thread implements Runnable {
       } else if (loc.equals("THIS")) {
         return "$" + event.name;
       } else if (loc.equals("VALUE")) {
-        return event.value;
+        return eventHost.globals.get(event.name);
       } else if (loc.equals("COORD")) {
         return String.valueOf(event.coordinate);
-      } else if (loc.equals("CURRTIME")) {
-        return String.valueOf(System.currentTimeMillis());
       } else if (loc.equals("POP")) {
         return threadstack.size() == 0 ? "null" : threadstack.remove(0);
       } else if (loc.equals("TOP")) {
@@ -264,7 +278,12 @@ class RunningEvent extends Thread implements Runnable {
       } else if (eventHost.colors.containsKey(loc)) {
         return "\u00a7" + eventHost.colors.get(loc);
       } else {
-        return String.valueOf(vars.get(loc));
+        String v = vars.get(loc);
+        if (v == null) {
+          vars.put(loc, "null");
+          v = "null";
+        }
+        return String.valueOf(v);
       }
 
     } else if (varname.charAt(0) == PLAYERSCOPE) { // player var
@@ -272,12 +291,13 @@ class RunningEvent extends Thread implements Runnable {
 
     } else if (varname.charAt(0) == GLOBALSCOPE) { // global perm var (event
                                                    // value)
-      Event ev = eventHost.findEvent(varname.substring(1));
-      if (ev == null) {
-        notifyError("Event not found!");
-        return "null";
+      String name = varname.substring(1);
+      if (eventHost.globals.containsKey(name)) {
+        String ret = eventHost.globals.get(name);
+        return ret;
       } else {
-        return String.valueOf(ev.value);
+        notifyError("Event " + name + " not found!");
+        return "null";
       }
     }
 
@@ -287,51 +307,24 @@ class RunningEvent extends Thread implements Runnable {
   /*---- Interaction ----*/
 
   private void say(ArrayList<String> tokens) {
-    if (tokens.size() != 2) {
-      notifyError("Wrong number of arguments!");
-      return;
-    }
-
-    Player p = server.findPlayer(tokens.get(0));
-    String message = tokens.get(1);
-
-    if (p != null) {
-      p.addTMessage(message);
-    } else {
-      notifyError("Player not found!");
-    }
-  }
-
-  private void give(ArrayList<String> tokens) {
     if (tokens.size() < 2) {
       notifyError("Wrong number of arguments!");
       return;
     }
 
-    Player p = server.findPlayer(tokens.get(0));
+    Player p = server.findPlayer(tokens.remove(0));
     if (p == null) {
-      notifyError("Player not online!");
+      notifyError("Player not found!");
       return;
     }
 
-    int id = 1;
-    if (tokens.get(1).matches("\\d+")) {
-      id = Integer.valueOf(tokens.get(1));
-    } else {
-      id = server.giveAliasList.getItemId(tokens.get(1)).id;
-    }
+    String message = new PostfixEvaluator(this).evaluateSingle(tokens);
+    p.addTMessage(message);
+  }
 
-    int amount = 1;
-    if (tokens.size() > 2)
-    {
-      try {
-        amount = Integer.valueOf(tokens.get(2));
-      } catch (Exception e) {
-      } // invalid amount
-    }
-
-    // give items
-    p.give(id, amount);
+  private void broadcast(ArrayList<String> tokens) {
+    String message = new PostfixEvaluator(this).evaluateSingle(tokens);
+    server.runCommand("say", message);
   }
 
   private void teleport(ArrayList<String> tokens) {
@@ -390,6 +383,12 @@ class RunningEvent extends Thread implements Runnable {
       return; // no command to execute
     }
 
+    Player p = server.findPlayer(tokens.remove(0));
+    if (p == null) {
+      notifyError("Player not found!");
+      return;
+    }
+
     String message = server.options.getBoolean("useSlashes") ? "/" : "!";
     for (String token : tokens) {
       message += token + " ";
@@ -397,7 +396,20 @@ class RunningEvent extends Thread implements Runnable {
     message = message.substring(0, message.length() - 1);
 
     // execute the server command, overriding the player permissions
-    player.parseCommand(message, true);
+    p.parseCommand(message, true);
+
+    // handle forwarding
+    String cmd = tokens.get(0);
+    PlayerCommand command = server.resolvePlayerCommand(cmd, p.getGroup());
+
+    // forwarding if necessary
+    CommandConfig config = server.config.commands.getTopConfig(cmd);
+    if ((command instanceof ExternalCommand)
+        || (config != null && config.forwarding != Forwarding.NONE)
+        || server.config.properties.getBoolean("forwardAllCommands")) {
+      p.forwardMessage(message);
+    }
+
   }
 
   private void execsvrcmd(ArrayList<String> tokens) {
@@ -407,16 +419,81 @@ class RunningEvent extends Thread implements Runnable {
     }
 
     String cmd = tokens.get(0);
-    String cmdline = "";
+    String args = "";
     for (String t : tokens) {
-      cmdline += t + " ";
+      args += t + " ";
     }
-    cmdline = cmdline.substring(0, cmdline.length() - 1);
+    args = args.substring(0, args.length() - 1);
 
     ServerCommand command = server.getCommandParser().getServerCommand(cmd);
+    if (command != null) {
+      server.runCommand(cmd, args);
+    }
 
-    if ((command != null) && !(command instanceof InvalidCommand)) {
-      command.execute(server, cmdline, feedback);
+  }
+
+  private void npcSpawn(ArrayList<String> tokens) {
+    if (tokens.size() < 5) {
+      notifyError("Wrong number of arguments!");
+      return;
+    }
+
+    String name = tokens.remove(0);
+    if (eventHost.npcs.get(name) != null) {
+      notifyError("An NPC with this name still exists!");
+      return;
+    }
+
+    Event event = eventHost.findEvent(tokens.remove(0));
+    if (event == null) {
+      notifyError("Event associated with NPC not found!");
+      return;
+    }
+
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    try {
+      x = Integer.valueOf(tokens.remove(0));
+      y = Integer.valueOf(tokens.remove(0));
+      z = Integer.valueOf(tokens.remove(0));
+    } catch (Exception e) {
+      notifyError("Invalid NPC spawn coordinate!");
+      return;
+    }
+    Coordinate c = new Coordinate(x, y, z);
+
+    try {
+      NpcBot s = new NpcBot(name, event.name, server, c);
+      server.bots.connect(s);
+      eventHost.npcs.put(name, s);
+    } catch (IOException ex) {
+      notifyError("Could not spawn NPC!");
+      ex.printStackTrace();
+    } catch (ConnectException e) {
+      notifyError("Could not spawn NPC!");
+      e.printStackTrace();
+    }
+  }
+
+  private void npcKill(ArrayList<String> tokens) {
+    if (tokens.size() < 1) {
+      notifyError("Wrong number of arguments!");
+      return;
+    }
+
+    String name = new PostfixEvaluator(this).evaluateSingle(tokens);
+    NpcBot b = eventHost.npcs.remove(name);
+    if (b == null) {
+      notifyError("An NPC with this name is not logged on!");
+      return;
+    }
+
+    try {
+      b.logout();
+    } catch (IOException e) {
+      notifyError("Error while logging out bot!");
+      e.printStackTrace();
     }
   }
 
@@ -507,9 +584,10 @@ class RunningEvent extends Thread implements Runnable {
     } else if (scope == PLAYERSCOPE) {
       player.vars.put(var, value);
     } else if (scope == GLOBALSCOPE) {
-      Event e = eventHost.findEvent(var);
-      if (e != null) {
-        e.value = value;
+      if (eventHost.globals.containsKey(var)) {
+        eventHost.globals.put(var, value);
+      } else {
+        notifyError("Assignment failed: event " + var + " not found!");
       }
     } else {
       notifyError("Assignment failed: Invalid variable reference!");
@@ -527,34 +605,37 @@ class RunningEvent extends Thread implements Runnable {
     threadstack.add(0, exp);
   }
 
+  private void cmdreturn(ArrayList<String> tokens) {
+    threadstack.add(0, PostfixEvaluator.fromArray(new PostfixEvaluator(this).evaluate(tokens)));
+  }
+
   private void cmdrun(ArrayList<String> tokens, boolean newThread) {
     if (tokens.size() < 1) {
       notifyError("Wrong number of arguments!");
       return;
     }
 
-    Event e = eventHost.findEvent(tokens.get(0));
+    Event e = eventHost.findEvent(tokens.remove(0));
 
     if (e == null) {
       notifyError("Event to run not found!");
       return;
     }
 
-    Player p = player;
-    if (tokens.size() > 1) {
-      p = server.findPlayer(tokens.get(1));
-    }
+    String args = PostfixEvaluator.fromArray(new PostfixEvaluator(this).evaluate(tokens));
 
     if (!newThread) {
       if (stackdepth < MAXDEPTH) {
-        (new RunningEvent(eventHost, null, e, p, stackdepth + 1, threadstack)).run();
+        threadstack.add(0, args);
+        (new RunningEvent(eventHost, null, e, player, stackdepth + 1, threadstack)).run();
       } else {
         notifyError("Can not run event - stack level too deep!");
       }
     } else { // run in a new thread (passing threadstack copy!)
       @SuppressWarnings("unchecked")
       ArrayList<String> clone = (ArrayList<String>) threadstack.clone();
-      eventHost.execute(e, p, true, clone);
+      clone.add(args);
+      eventHost.executeEvent(e, player, clone);
     }
   }
 
@@ -660,9 +741,4 @@ class RunningEvent extends Thread implements Runnable {
     System.out.println(err + "\n");
   }
 
-  private CommandFeedback feedback = new CommandFeedback() {
-    public void send(String message, Object... args) {
-      System.out.println("[SimpleServer] " + String.format(message, args));
-    }
-  };
 }

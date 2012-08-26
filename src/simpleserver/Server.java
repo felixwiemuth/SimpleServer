@@ -28,12 +28,15 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.UnknownHostException;
+import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.Semaphore;
 
 import simpleserver.bot.BotController;
+import simpleserver.command.ExternalCommand;
+import simpleserver.command.PlayerCommand;
 import simpleserver.config.GiveAliasList;
 import simpleserver.config.HelpText;
 import simpleserver.config.IPBanList;
@@ -45,8 +48,10 @@ import simpleserver.config.RobotList;
 import simpleserver.config.Rules;
 import simpleserver.config.WhiteList;
 import simpleserver.config.data.GlobalData;
+import simpleserver.config.xml.CommandConfig;
 import simpleserver.config.xml.Config;
 import simpleserver.config.xml.GlobalConfig;
+import simpleserver.config.xml.Group;
 import simpleserver.events.EventHost;
 import simpleserver.export.CustAuthExport;
 import simpleserver.lang.Translations;
@@ -60,6 +65,7 @@ import simpleserver.minecraft.MinecraftWrapper;
 import simpleserver.nbt.WorldFile;
 import simpleserver.options.Options;
 import simpleserver.rcon.RconServer;
+import simpleserver.stream.Encryption.ClientEncryption;
 import simpleserver.telnet.TelnetServer;
 import simpleserver.thread.AutoBackup;
 import simpleserver.thread.AutoFreeSpaceChecker;
@@ -256,17 +262,21 @@ public class Server {
 
     addressFactory.toggle(!config.properties.getBoolean("disableAddressFactory"));
 
-    saveResources();
-
     // reload events from config
     if (eventhost != null) {
       eventhost.loadEvents();
     }
 
+    saveResources();
+
     return globalConfig.loadsuccess;
   }
 
   public void saveResources() {
+    if (eventhost != null) {
+      eventhost.saveGlobalVars();
+    }
+
     for (Resource resource : resources) {
       resource.save();
     }
@@ -336,6 +346,35 @@ public class Server {
 
   public CommandParser getCommandParser() {
     return commandParser;
+  }
+
+  public PlayerCommand resolvePlayerCommand(String commandName, Group groupObject) {
+    CommandConfig cmdconfig = config.commands.getTopConfig(commandName);
+    String originalName = cmdconfig == null ? commandName : cmdconfig.originalName;
+
+    PlayerCommand command;
+    if (cmdconfig == null) {
+      command = commandParser.getPlayerCommand(commandName);
+      if (command != null && !command.hidden()) {
+        command = null;
+      }
+    } else {
+      command = commandParser.getPlayerCommand(originalName);
+    }
+
+    if (command == null) {
+      if ((groupObject != null && groupObject.forwardUnknownCommands) || cmdconfig != null) {
+        command = new ExternalCommand(commandName);
+      } else {
+        command = commandParser.getPlayerCommand((String) null);
+      }
+    }
+
+    return command;
+  }
+
+  public PlayerCommand resolvePlayerCommand(String commandName) {
+    return resolvePlayerCommand(commandName, null);
   }
 
   public void runCommand(String command, String arguments) {
@@ -468,6 +507,14 @@ public class Server {
     } catch (InterruptedException e) {
       // Severe error happened while starting up.
       // Already on track to stop/restart.
+    }
+
+    try {
+      ClientEncryption.generateKeyPair();
+    } catch (NoSuchAlgorithmException e) {
+      System.out.println("[SimpleServer] Error while generating RSA key pair");
+      e.printStackTrace();
+      System.exit(1);
     }
 
     if (options.getBoolean("enableTelnet")) {

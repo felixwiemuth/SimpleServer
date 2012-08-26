@@ -20,8 +20,6 @@
  */
 package simpleserver.bot;
 
-import static simpleserver.stream.StreamTunnel.ENCHANTABLE;
-
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
@@ -36,9 +34,10 @@ import java.util.concurrent.locks.ReentrantLock;
 import simpleserver.Coordinate.Dimension;
 import simpleserver.Position;
 import simpleserver.Server;
+import simpleserver.stream.Encryption.ServerEncryption;
 
 public class Bot {
-  private static final int VERSION = 29;
+  private static final int VERSION = 39;
 
   protected String name;
   protected Server server;
@@ -46,6 +45,7 @@ public class Bot {
   private boolean expectDisconnect;
   protected boolean ready;
   protected boolean dead;
+  protected int playerEntityId;
 
   private Socket socket;
   protected DataInputStream in;
@@ -57,6 +57,8 @@ public class Bot {
   protected boolean gotFirstPacket = false;
   private byte lastPacket;
   private short health;
+
+  private ServerEncryption encryption = new ServerEncryption();
 
   public Bot(Server server, String name) {
     this.name = name;
@@ -72,8 +74,8 @@ public class Bot {
     } catch (Exception e) {
       socket = new Socket(InetAddress.getByName(null), server.options.getInt("internalPort"));
     }
-    in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-    out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+    in = new DataInputStream(socket.getInputStream());
+    out = new DataOutputStream(socket.getOutputStream());
 
     writeLock = new ReentrantLock();
 
@@ -100,7 +102,10 @@ public class Bot {
   private void handshake() throws IOException {
     writeLock.lock();
     out.writeByte(2);
-    write(name + ";localbot");
+    out.writeByte(VERSION);
+    write(name);
+    write("localhost");
+    out.writeInt(server.options.getInt("internalPort"));
     out.flush();
     writeLock.unlock();
   }
@@ -115,26 +120,28 @@ public class Bot {
 
   protected void login() throws IOException {
     writeLock.lock();
-    out.writeByte(1);
-    out.writeInt(VERSION);
-    write(name);
-    write("DEFAULT");
-    out.writeInt(0);
-    out.writeInt(0);
+    out.writeByte(0xcd);
     out.writeByte(0);
-    out.writeByte(0);
-    out.writeByte(0);
+    writeLock.unlock();
+  }
+
+  private void sendSharedKey() throws IOException {
+    writeLock.lock();
+    out.writeByte(0xfc);
+    byte[] key = encryption.getEncryptedSharedKey();
+    out.writeShort(key.length);
+    out.write(key);
+    byte[] challengeTokenResponse = encryption.encryptChallengeToken();
+    out.writeShort(challengeTokenResponse.length);
+    out.write(challengeTokenResponse);
+    out.flush();
     writeLock.unlock();
   }
 
   private void respawn() throws IOException {
     writeLock.lock();
-    out.writeByte(9);
-    out.writeInt(position.dimension.index());
-    out.writeByte(0);
-    out.writeByte(0);
-    out.writeShort(128);
-    write("DEFAULT");
+    out.writeByte(0xcd);
+    out.writeByte(1);
     writeLock.unlock();
   }
 
@@ -170,17 +177,16 @@ public class Bot {
   protected void handlePacket(byte packetId) throws IOException {
     // System.out.println("Packet: 0x" + Integer.toHexString(packetId));
     switch (packetId) {
-      case 0x2: // Handshake
+      case 0x01: // Login Request
+        int eid = in.readInt();
+        if (playerEntityId == 0) {
+          playerEntityId = eid;
+        }
+
         readUTF16();
-        login();
-        break;
-      case 0x1: // Login Request
-        in.readInt();
-        readUTF16();
-        readUTF16();
-        in.readInt();
+        in.readByte();
         position.dimension = Dimension.get(in.readByte());
-        in.readInt();
+        in.readByte();
         in.readByte();
         in.readByte();
         break;
@@ -218,7 +224,6 @@ public class Bot {
         String reason = readUTF16();
         error(reason);
         break;
-
       case 0x00: // Keep Alive
         keepAlive(in.readInt());
         break;
@@ -231,8 +236,7 @@ public class Bot {
       case 0x05: // Entity Equipment
         in.readInt();
         in.readShort();
-        in.readShort();
-        in.readShort();
+        readItem();
         break;
       case 0x06: // Spawn Position
         readNBytes(12);
@@ -240,7 +244,6 @@ public class Bot {
       case 0x07: // Use Entity
         in.readInt();
         in.readInt();
-        in.readBoolean();
         in.readBoolean();
         break;
       case 0x08: // Update Health
@@ -260,7 +263,7 @@ public class Bot {
         readUTF16();
         break;
       case 0x0a: // Player
-        in.readByte();
+        in.readBoolean();
         break;
       case 0x0c: // Player Look
         readNBytes(9);
@@ -278,9 +281,12 @@ public class Bot {
         in.readInt();
         in.readByte();
         readItem();
+        in.readByte();
+        in.readByte();
+        in.readByte();
         break;
       case 0x10: // Holding Change
-        readNBytes(2);
+        in.readShort();
         break;
       case 0x11: // Use Bed
         readNBytes(14);
@@ -296,6 +302,7 @@ public class Bot {
         in.readInt();
         readUTF16();
         readNBytes(16);
+        readUnknownBlob();
         break;
       case 0x15: // Pickup spawn
         readNBytes(24);
@@ -325,6 +332,9 @@ public class Bot {
         in.readByte();
         in.readByte();
         in.readByte();
+        in.readShort();
+        in.readShort();
+        in.readShort();
         readUnknownBlob();
         break;
       case 0x19: // Entity: Painting
@@ -346,7 +356,10 @@ public class Bot {
         readNBytes(10);
         break;
       case 0x1d: // Destroy Entity
-        readNBytes(4);
+        byte destroyCount = in.readByte();
+        if (destroyCount > 0) {
+          readNBytes(destroyCount * 4);
+        }
         break;
       case 0x1e: // Entity
         readNBytes(4);
@@ -392,31 +405,41 @@ public class Bot {
         in.readShort();
         in.readShort();
         break;
-      case 0x32: // Pre-Chunk
-        readNBytes(9);
-        break;
       case 0x33: // Map Chunk
         readNBytes(13);
-        readNBytes(in.readInt() + 4);
+        readNBytes(in.readInt());
         break;
       case 0x34: // Multi Block Change
-        readNBytes(8);
-        readNBytes(in.readShort());
+        in.readInt();
+        in.readInt();
+        in.readShort();
+        readNBytes(in.readInt());
         break;
       case 0x35: // Block Change
         in.readInt();
         in.readByte();
         in.readInt();
-        in.readByte();
+        in.readShort();
         in.readByte();
         break;
       case 0x36: // Block Action
-        readNBytes(12);
+        readNBytes(13);
+        break;
+      case 0x37: // Mining progress
+        in.readInt();
+        in.readInt();
+        in.readInt();
+        in.readInt();
+        in.readByte();
+        break;
+      case 0x38: // Chunk Bulk
+        readNBytes(in.readShort() * 12 + in.readInt());
         break;
       case 0x3c: // Explosion
         readNBytes(28);
         int recordCount = in.readInt();
         readNBytes(recordCount * 3);
+        readNBytes(12);
         break;
       case 0x3d: // Sound/Particle Effect
         in.readInt();
@@ -424,6 +447,14 @@ public class Bot {
         in.readByte();
         in.readInt();
         in.readInt();
+        break;
+      case 0x3e: // Named Sound Effect
+        readUTF16();
+        in.readInt();
+        in.readInt();
+        in.readInt();
+        in.readFloat();
+        in.readByte();
         break;
       case 0x46: // New/Invalid State
         readNBytes(2);
@@ -468,7 +499,7 @@ public class Bot {
       case 0x6a: // Transaction
         in.readByte();
         in.readShort();
-        in.readByte();
+        in.readBoolean();
         break;
       case 0x6b: // Creative Inventory Action
         in.readShort();
@@ -486,20 +517,21 @@ public class Bot {
         readUTF16();
         readUTF16();
         break;
-      case (byte) 0x84: // added in 12w06a
-        in.readInt();
-        in.readShort();
-        in.readInt();
-        in.readByte();
-        in.readInt();
-        in.readInt();
-        in.readInt();
-        break;
       case (byte) 0x83: // Item Data
         in.readShort();
         in.readShort();
         byte length = in.readByte();
         readNBytes(0xff & length);
+        break;
+      case (byte) 0x84: // added in 12w06a
+        in.readInt();
+        in.readShort();
+        in.readInt();
+        in.readByte();
+        short nbtLenght = in.readShort();
+        if (nbtLenght > 0) {
+          readNBytes(nbtLenght);
+        }
         break;
       case (byte) 0xc8: // Increment Statistic
         readNBytes(5);
@@ -510,10 +542,21 @@ public class Bot {
         in.readShort();
         break;
       case (byte) 0xca: // Player Abilities
-        in.readBoolean();
-        in.readBoolean();
-        in.readBoolean();
-        in.readBoolean();
+        in.readByte();
+        in.readByte();
+        in.readByte();
+        break;
+      case (byte) 0xcb: // Tab-Completion
+        readUTF16();
+        break;
+      case (byte) 0xcc: // Locale and View Distance
+        readUTF16();
+        in.readByte();
+        in.readByte();
+        in.readByte();
+        break;
+      case (byte) 0xcd: // Login & Respawn
+        in.readByte();
         break;
       case (byte) 0xe6: // ModLoaderMP by SDK
         in.readInt(); // mod
@@ -530,6 +573,25 @@ public class Bot {
         short arrayLength = in.readShort();
         readNBytes(0xff & arrayLength);
         break;
+      case (byte) 0xfc: // Encryption Key Response
+        byte[] sharedKey = new byte[in.readShort()];
+        in.readFully(sharedKey);
+        byte[] challangeTokenResponse = new byte[in.readShort()];
+        in.readFully(challangeTokenResponse);
+        in = new DataInputStream(new BufferedInputStream(encryption.encryptedInputStream(socket.getInputStream())));
+        out = new DataOutputStream(new BufferedOutputStream(encryption.encryptedOutputStream(socket.getOutputStream())));
+        login();
+        break;
+      case (byte) 0xfd: // Encryption Key Request (server -> client)
+        readUTF16();
+        byte[] keyBytes = new byte[in.readShort()];
+        in.readFully(keyBytes);
+        byte[] challangeToken = new byte[in.readShort()];
+        in.readFully(challangeToken);
+        encryption.setPublicKey(keyBytes);
+        encryption.setChallengeToken(challangeToken);
+        sendSharedKey();
+        break;
       case (byte) 0xfe: // Server List Ping
         break;
       default:
@@ -540,15 +602,12 @@ public class Bot {
   }
 
   private void readItem() throws IOException {
-    short id;
-    if ((id = in.readShort()) > 0) {
+    if (in.readShort() > 0) {
       in.readByte();
       in.readShort();
-      if (ENCHANTABLE.contains(id)) {
-        short length;
-        if ((length = in.readShort()) > 0) {
-          readNBytes(length);
-        }
+      short length;
+      if ((length = in.readShort()) > 0) {
+        readNBytes(length);
       }
     }
   }

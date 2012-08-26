@@ -28,12 +28,17 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import simpleserver.Player;
 import simpleserver.Server;
+import simpleserver.bot.NpcBot;
 import simpleserver.config.xml.Event;
 
 public class EventHost {
 
-  public ConcurrentHashMap<Event, Long> events; // stores last calls for events
   public HashMap<String, String> colors;
+  public ConcurrentHashMap<Event, Long> events; // stores events and their last
+                                                // calls
+  public ConcurrentHashMap<String, String> globals; // cache for global event
+                                                    // vars
+  public ConcurrentHashMap<String, NpcBot> npcs; // stores the online npcs
 
   protected Server server;
   protected Random rng;
@@ -41,22 +46,37 @@ public class EventHost {
   protected HashMap<String, RunningEvent> running;
 
   public void loadEvents() {
-    // make old threads shut down if any
-    if (running != null) {
-      for (String k : running.keySet()) {
-        running.get(k).stopping = true;
-        running.get(k).interrupt();
+    // try to make old threads shut down if any
+    try {
+      if (running != null) {
+        for (String k : running.keySet()) {
+          running.get(k).stopping = true;
+          running.get(k).interrupt();
+        }
       }
+    } catch (Exception e) {
+      // ignore failures...
     }
 
     // initialize
+    npcs = new ConcurrentHashMap<String, NpcBot>();
     running = new HashMap<String, RunningEvent>();
     events = new ConcurrentHashMap<Event, Long>();
+    globals = new ConcurrentHashMap<String, String>();
 
     Iterator<Event> it = server.config.events.iterator();
     while (it.hasNext()) {
       Event ev = it.next();
       events.put(ev, (long) 0);
+      globals.put(ev.name, ev.value);
+    }
+  }
+
+  public void saveGlobalVars() {
+    Iterator<Event> it = server.config.events.iterator();
+    while (it.hasNext()) {
+      Event ev = it.next();
+      ev.value = globals.get(ev.name);
     }
   }
 
@@ -90,11 +110,31 @@ public class EventHost {
     }
   }
 
-  /* Execute given event triggered by given player */
-  public void execute(Event e, Player p, boolean forced, ArrayList<String> args) {
+  /* General event call */
+  protected void executeEvent(Event e, Player p, ArrayList<String> stack) {
     // DEBUG
     // System.out.println(p.getName()
     // +"->"+e.name+"@"+System.currentTimeMillis());
+
+    if (e == null) { // no event given -> abort
+      return;
+    }
+
+    // no stack given -> add empty array representing no arguments
+    if (stack == null) {
+      stack = new ArrayList<String>();
+      stack.add(PostfixEvaluator.fromArray(new ArrayList<String>()));
+    }
+
+    // Start top level event in new thread
+    String threadname = e.name + String.valueOf(System.currentTimeMillis());
+    RunningEvent rev = new RunningEvent(this, threadname, e, p, 0, stack);
+    rev.start();
+    running.put(threadname, rev);
+  }
+
+  /* Execute given event triggered by given player */
+  public void execute(Event e, Player p, boolean forced, ArrayList<String> args) {
 
     if (e == null) { // no event given -> abort
       return;
@@ -120,11 +160,14 @@ public class EventHost {
       events.put(e, currtime); // Update last event call time
     }
 
-    // Start top level event in new thread
-    String threadname = e.name + String.valueOf(System.currentTimeMillis());
-    RunningEvent rev = new RunningEvent(this, threadname, e, p, 0, args);
-    rev.start();
-    running.put(threadname, rev);
+    /* pack an array with the passed arguments onto the stack for that event */
+    if (args == null) {
+      args = new ArrayList<String>();
+    }
+
+    ArrayList<String> stack = new ArrayList<String>();
+    stack.add(PostfixEvaluator.fromArray(args));
+    executeEvent(e, p, stack);
   }
 
   public Event findEvent(String name) {
